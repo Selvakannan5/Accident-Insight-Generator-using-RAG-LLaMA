@@ -5,27 +5,58 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from ollama import Client
 from datetime import datetime
+import os
+from metrics import get_metrics_tracker
 
 DATASET_PATH = "virtual_city_accidents_dataset.csv"
 OLLAMA_MODEL = "llama3.2:latest"
 
+# Initialize metrics tracker
+metrics = get_metrics_tracker()
+
 @st.cache_data
 def load_dataset_and_index():
+    """Load dataset and create FAISS index with metrics tracking."""
+    # Start indexing timer
+    indexing_start = metrics.log_indexing_start(num_reports=1000)  # Estimated
+    
     df = pd.read_csv(DATASET_PATH)
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    
     accident_embeddings = embedder.encode(df['Accident_Report'].tolist(), convert_to_tensor=False)
     accident_embeddings = np.array(accident_embeddings)
     dimension = accident_embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
     index.add(accident_embeddings)
-    return df, embedder, index
+    
+    # Calculate index size in MB
+    index_size_mb = os.path.getsize(DATASET_PATH) / (1024 * 1024)
+    
+    # Log indexing completion
+    indexing_stats = metrics.log_indexing_end(indexing_start, index_size_mb)
+    
+    return df, embedder, index, indexing_stats
 
 st.write("🔄 Loading model and dataset...")
-df, embedder, index = load_dataset_and_index()
+df, embedder, index, indexing_stats = load_dataset_and_index()
+
 client = Client(host='http://localhost:11434')
 st.success(f"✅ Model and data loaded. ({len(df)} reports)")
 
+# Display indexing metrics in sidebar
+with st.sidebar:
+    st.subheader("📊 System Metrics")
+    if st.checkbox("Show Indexing Stats"):
+        st.metric("Reports Indexed", indexing_stats["reports_indexed"])
+        st.metric("Indexing Time (s)", f"{indexing_stats['indexing_duration']:.2f}")
+        st.metric("Time per Report (ms)", f"{indexing_stats['time_per_report_ms']:.2f}")
+
 def generate_precaution_ollama(accident_id, date_time, location, vehicle, weather, road, cause, report, k=5, model=OLLAMA_MODEL):
+    """Generate safety precautions with metrics tracking."""
+    
+    # Start response timer
+    response_timer = metrics.start_response_timer()
+    
     new_report = (
         f"Accident ID: {accident_id}\n"
         f"Date & Time: {date_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -40,6 +71,15 @@ def generate_precaution_ollama(accident_id, date_time, location, vehicle, weathe
     new_embedding = embedder.encode([new_report])[0]
     D, I = index.search(np.array([new_embedding]), k)
     similar_reports = df.iloc[I[0]]['Accident_Report'].tolist()
+    
+    # Log retrieval metrics
+    retrieval_metrics = metrics.log_retrieval(
+        query=new_report[:200],  # Log first 200 chars of query
+        retrieved_docs=similar_reports,
+        distances=D[0],
+        ground_truth_relevant=None  # Could be provided if ground truth exists
+    )
+    
     context = "\n".join(f"- {r}" for r in similar_reports)
     
     prompt = f"""
@@ -52,14 +92,18 @@ Based on the following past accident reports:
 And this new accident report with details:
 {new_report}
 
-Please suggest **3 to 5 short, concise bullet points** of high-impact safety regulations or preventive actions that the government or local authorities should implement to reduce such accidents. Use simple language and keep it brief. Focus only on systemic or infrastructural improvements.
+Please suggest **3 to 5 short, concise bullet points** of high-impact safety regulations or preventive actions that the government or local authorities should implement to reduce such accidents. 
 Also predict the potential areas where accidents can happen(Give in points) Give unique suggestions for each accident according to the given report.
 """
     response = client.chat(
         model=model,
         messages=[{"role": "user", "content": prompt.strip()}]
     )
-    return response['message']['content']
+    
+    # Log response time
+    response_time_metrics = metrics.log_response_time(response_timer, new_report, num_similar_docs=k)
+    
+    return response['message']['content'], retrieval_metrics, response_time_metrics
 
 st.title("🚧 Accident Precaution Generator")
 
@@ -81,10 +125,65 @@ if st.button("Generate Safety Precautions"):
     else:
         with st.spinner("Generating safety precautions..."):
             try:
-                output = generate_precaution_ollama(
+                output, retrieval_metrics, response_time_metrics = generate_precaution_ollama(
                     accident_id, datetime_combined, location, vehicle, weather, road, cause, report, k=5
                 )
                 st.subheader("🛡️ Suggested Precautions:")
                 st.markdown(output)
+                
+                # Display metrics
+                with st.expander("📈 Performance Metrics"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("Retrieval Metrics")
+                        st.metric("Documents Retrieved", retrieval_metrics["num_retrieved"])
+                        st.metric("Mean Distance", f"{retrieval_metrics['mean_retrieval_distance']:.4f}")
+                        st.metric("Min Distance", f"{retrieval_metrics['min_distance']:.4f}")
+                        st.metric("Max Distance", f"{retrieval_metrics['max_distance']:.4f}")
+                    
+                    with col2:
+                        st.subheader("Response Metrics")
+                        st.metric("Response Time (ms)", f"{response_time_metrics['response_time_ms']:.2f}")
+                        st.metric("Query Length", response_time_metrics['query_length'])
+                    
+                    # Option to rate relevance
+                    st.subheader("Rate Relevance")
+                    relevance_score = st.slider("How relevant were the retrieved documents?", 0.0, 1.0, 0.5)
+                    if st.button("Submit Feedback"):
+                        metrics.log_user_feedback(
+                            query=report[:100],
+                            retrieved_doc_idx=0,
+                            is_relevant=relevance_score > 0.5,
+                            relevance_score=relevance_score
+                        )
+                        st.success("✅ Feedback recorded!")
+                
             except Exception as e:
                 st.error(f"❌ Error: {e}")
+
+# Metrics dashboard in sidebar
+with st.sidebar:
+    if st.button("📊 Show Metrics Dashboard"):
+        st.subheader("System Metrics Summary")
+        
+        retrieval_stats = metrics.get_retrieval_stats()
+        response_stats = metrics.get_response_time_stats()
+        relevance_stats = metrics.get_relevance_stats()
+        
+        if retrieval_stats.get("total_queries"):
+            st.write("**Retrieval Statistics:**")
+            st.json(retrieval_stats)
+        
+        if response_stats.get("total_queries"):
+            st.write("**Response Time Statistics:**")
+            st.json(response_stats)
+        
+        if relevance_stats.get("total_feedback"):
+            st.write("**Relevance Statistics:**")
+            st.json(relevance_stats)
+    
+    if st.button("💾 Save Metrics"):
+        filepath = metrics.save_metrics_to_file()
+        st.success(f"✅ Metrics saved to {filepath}")
+        metrics.print_summary()
